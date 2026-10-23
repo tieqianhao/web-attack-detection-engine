@@ -4,7 +4,7 @@ ground_truth.jsonl
 alerts.jsonl
 对抗测试结果.json
 dashboard.html
-检测报告.md
+/检测报告.md
 *.log
 
 # Python

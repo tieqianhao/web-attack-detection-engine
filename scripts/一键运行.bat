@@ -4,9 +4,22 @@ REM 攻击检测平台 - 一键运行（Windows）
 REM 双击本文件即可完成：起靶场 -> 打流量 -> 检测 -> 出报告
 REM ============================================
 
-cd /d "%~dp0"
+REM 回到仓库根目录（本脚本位于 scripts/）
+cd /d "%~dp0.."
 
-set PY=C:\Users\余星乐\.workbuddy\binaries\python\versions\3.13.12\python.exe
+REM 自动探测 Python：优先 python，其次 py，都没有则报错退出
+set PY=python
+where python >nul 2>nul
+if errorlevel 1 (
+    set PY=py
+    where py >nul 2>nul
+    if errorlevel 1 (
+        echo [错误] 未找到 Python，请先安装 Python 3 并加入 PATH。
+        pause
+        exit /b 1
+    )
+)
+echo 使用解释器：%PY%
 
 echo [1/4] 清空上一轮数据...
 if exist access.log del /q access.log
