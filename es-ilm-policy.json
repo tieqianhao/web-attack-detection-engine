@@ -1,0 +1,27 @@
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "set_priority": { "priority": 100 },
+          "rollover": { "max_primary_shard_size": "5gb", "max_age": "7d" }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "set_priority": { "priority": 50 },
+          "forcemerge": { "max_num_segments": 1 }
+        }
+      },
+      "delete": {
+        "min_age": "30d",
+        "actions": { "delete": {} }
+      }
+    }
+  },
+  "_meta": {
+    "说明": "访问日志保留 30 天。安全告警若需长期留存，建议另建 security-alert-* 索引并单独配 180 天策略。"
+  }
+}

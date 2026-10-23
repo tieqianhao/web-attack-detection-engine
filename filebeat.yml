@@ -1,0 +1,32 @@
+# Filebeat 配置：采集靶场访问日志 → Elasticsearch
+# 挂载方式见 docker-compose.yml（宿主机 access.log → 容器 /var/log/lab/access.log）
+
+filebeat.inputs:
+  - type: filestream
+    id: lab-access
+    enabled: true
+    paths:
+      - /var/log/lab/access.log
+    # 首次运行读取历史日志；重复实验时改为 false 只读新增
+    clean_ingested: false
+    fields:
+      log_source: lab-target
+    fields_under_root: true
+
+# 如果日志是 Nginx combined 格式，可直接用内置模块解析
+# filebeat.modules:
+#   - module: nginx
+#     access:
+#       enabled: true
+#       var.paths: ["/var/log/lab/access.log*"]
+
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  index: "lab-access-%{+yyyy.MM.dd}"
+
+setup.template.name: "lab-access"
+setup.template.pattern: "lab-access-*"
+setup.ilm.enabled: false
+
+logging.level: info
+logging.to_files: false

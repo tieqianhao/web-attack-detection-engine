@@ -1,0 +1,21 @@
+# 运行产物（重新跑实验会再生成）
+access.log
+ground_truth.jsonl
+alerts.jsonl
+对抗测试结果.json
+dashboard.html
+检测报告.md
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

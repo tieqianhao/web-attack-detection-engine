@@ -1,0 +1,32 @@
+{
+  "index_patterns": ["web-access-*", "security-alert-*"],
+  "priority": 200,
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "refresh_interval": "5s",
+      "index.lifecycle.name": "web-log-policy",
+      "index.lifecycle.rollover_alias": "web-access"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp":  { "type": "date" },
+        "ip":          { "type": "ip" },
+        "method":      { "type": "keyword" },
+        "url":         { "type": "wildcard" },
+        "status":      { "type": "integer" },
+        "ua":          { "type": "text", "fields": { "kw": { "type": "keyword", "ignore_above": 256 } } },
+        "referer":     { "type": "keyword" },
+        "body":        { "type": "text" },
+        "rule_id":     { "type": "keyword" },
+        "rule_name":   { "type": "keyword" },
+        "severity":    { "type": "keyword" },
+        "is_attack":   { "type": "boolean" }
+      }
+    }
+  },
+  "_meta": {
+    "说明": "单机实验环境：1 主分片 / 0 副本（单节点设副本会永远 yellow）。日志量小，1 分片足够；生产可按每天 30-50GB 一个分片估算。"
+  }
+}
