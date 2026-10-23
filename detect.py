@@ -120,9 +120,22 @@ def emit(alert):
         f.write(line + "\n")
 
 
-def make_alert(rule_id, rule_name, level, rec, evidence):
+def make_alert(rule_id, rule_name, level, rec, evidence, ts=None):
+    """
+    ts 必须传"触发这条告警的那条请求的时间"，不能默认用运行时刻。
+
+    踩过的坑：行为事件（R7/R8）最初用 now_str() 打时间戳，
+    而日志里请求的时间来自日志本身。两者差了几小时之后，
+    下游按 120 秒窗口做"事件与请求关联"时永远对不上，
+    于是爆破明明被 R8 抓到了，却在指标里被算成漏报（检出率 100% → 88.9%）。
+    事件时间不等于处理时间——这是流式检测里最容易错的一处。
+    """
+    if ts is None:
+        ts = now_str()
+    elif isinstance(ts, (int, float)):
+        ts = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
     return {
-        "ts": now_str(),
+        "ts": ts,
         "rule_id": rule_id,
         "rule_name": rule_name,
         "level": level,
@@ -187,6 +200,23 @@ def _decode_overlong(match):
     return match.group(0)
 
 
+def _fold_double_write(s):
+    """
+    双写关键词还原：ununionion → union
+
+    双写是专门对付"把关键字替换成空串"的过滤器的——删一次还剩一个。
+    所以检测方要做的不是删关键字，而是把这种"重叠双写"折回单词本身：
+        kw[:h] + kw + kw[h:]  →  kw      (h 取 1..len-1)
+    """
+    for kw in ("union", "select", "script", "alert", "sleep", "information_schema"):
+        L = len(kw)
+        for h in range(1, L):
+            pat = kw[:h] + kw + kw[h:]
+            if pat in s.lower():
+                s = re.sub(re.escape(pat), kw, s, flags=re.I)
+    return s
+
+
 def deep_normalize(text, comment_to_space=False):
     """
     深度规范化：把各种"语义等价但字面不同"的写法折叠成同一形态。
@@ -246,7 +276,9 @@ def deep_normalize(text, comment_to_space=False):
     s = re.sub(r";(?=/)", "", s)
     # 7) 多重空白压缩
     s = re.sub(r" {2,}", " ", s)
-    # 8) Unicode 兼容归一化：全角字符、全角空格折叠成半角
+    # 8.5) 双写关键词还原（ununionion → union）
+    s = _fold_double_write(s)
+    # 9) Unicode 兼容归一化：全角字符、全角空格折叠成半角
     s = unicodedata.normalize("NFKC", s)
     # 9) 同形字映射：ı/İ 之类长得像 ASCII 但 NFKC 不会折叠的字符
     for a, b in HOMOGLYPHS:
@@ -281,6 +313,137 @@ def collect_blob(rec):
     return " ".join(parts)
 
 
+# ---------- 语义层：字面无共同点，但语义等价 ----------
+#
+# 归一化层的能力边界就在这里：
+#   它能折叠的都是"有语法特征可抓"的编码——CHAR()、超长编码、内联注释，形态明确。
+#   而 || 与 or、2>1 与 1=1 这类替换，在字符串层面毫无共同点，
+#   只有先"理解 SQL"，才知道它们等价。
+#
+# 所以第三层必须做最小限度的语义分析：
+#   词法化 → 操作符等价归一 → 常量折叠 → 关键字序列匹配
+# 这不是完整的 SQL 解析器（那需要语法树 + 执行语义），
+# 但它用几十行换来了语义层的一部分覆盖，并把"边界在哪"讲清楚了。
+
+_SQL_TOKEN_RE = re.compile(
+    r"(?P<str>'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\")"
+    r"|(?P<num>\d+(?:\.\d+)?)"
+    r"|(?P<op>\|\||&&|<=|>=|<>|!=|=|<|>|\+|-|/|%|;|,|\(|\)|\.|`|&|\||\*)"
+    r"|(?P<id>[A-Za-z_$][A-Za-z0-9_$]*)"
+)
+
+_OP_EQUIV = {"||": "OR", "&&": "AND"}
+_SHELL_CMDS = {"cat", "ls", "whoami", "wget", "curl", "nc", "bash", "sh",
+               "chmod", "python", "perl", "ping", "nslookup", "tftp", "telnet"}
+_TIME_FN = {"sleep", "benchmark", "pg_sleep", "waitfor", "dbms_pipe"}
+
+
+def sql_tokens(s):
+    """把归一化后的串切成 token 流：[(kind, value), ...]"""
+    toks = []
+    for m in _SQL_TOKEN_RE.finditer(s or ""):
+        kind = m.lastgroup
+        val = m.group()
+        if kind == "op":
+            val = _OP_EQUIV.get(val, val)
+            if val in ("OR", "AND"):
+                kind = "id"
+        if kind == "id":
+            toks.append(("id", val.lower()))
+        elif kind == "num":
+            toks.append(("num", val))
+        elif kind == "str":
+            toks.append(("str", val))
+        else:
+            toks.append(("op", val))
+    return toks
+
+
+def fold_constants(toks):
+    """
+    常量折叠：2>1、1=1、'a'='a' → __TRUE__
+
+    这是识别"等价替换"的关键一步：
+      2>1 和 1=1 字面完全不同，但折叠之后都是同一个 __TRUE__。
+      有了它，正则里那条 or\s+1\s*=1 就不再是唯一能匹配的形态。
+    """
+    cmp_op = {"<": lambda a, b: a < b, ">": lambda a, b: a > b,
+              "=": lambda a, b: a == b, "<=": lambda a, b: a <= b,
+              ">=": lambda a, b: a >= b, "<>": lambda a, b: a != b,
+              "!=": lambda a, b: a != b}
+    out, i = [], 0
+    while i < len(toks):
+        k, v = toks[i]
+        if k == "num" and i + 2 < len(toks) and toks[i + 1][0] == "op" \
+                and toks[i + 1][1] in cmp_op and toks[i + 2][0] == "num":
+            try:
+                val = cmp_op[toks[i + 1][1]](float(v), float(toks[i + 2][1]))
+                out.append(("const", "__TRUE__" if val else "__FALSE__"))
+                i += 3
+                continue
+            except Exception:
+                pass
+        if k == "str" and i + 2 < len(toks) and toks[i + 1][0] == "op" \
+                and toks[i + 1][1] in ("=", "<>", "!=") and toks[i + 2][0] == "str":
+            same = v == toks[i + 2][1]
+            if toks[i + 1][1] != "=":
+                same = not same
+            out.append(("const", "__TRUE__" if same else "__FALSE__"))
+            i += 3
+            continue
+        out.append((k, v))
+        i += 1
+    return out
+
+
+def semantic_detect(rec, blob=None):
+    """语义层规则 S1–S5。与特征规则互补：特征看字面，语义看结构。"""
+    if blob is None:
+        blob = collect_blob(rec)
+    seen, hits = set(), []
+
+    def hit(rid, name, level, ev):
+        if rid not in seen:
+            seen.add(rid)
+            hits.append(make_alert(rid, name, level, rec, ev))
+
+    for cand in (deep_normalize(blob), deep_normalize(blob, comment_to_space=True)):
+        toks = fold_constants(sql_tokens(cand))
+        ids = [v for k, v in toks if k == "id"]
+
+        # S1 永真条件：or / and / xor 之后 4 个 token 内出现恒真表达式
+        for i, (k, v) in enumerate(toks):
+            if k == "id" and v in ("or", "and", "xor"):
+                if any(t[0] == "const" and t[1] == "__TRUE__" for t in toks[i + 1:i + 5]):
+                    hit("S1", "永真条件（语义层）", "high", "%s + 恒真表达式" % v)
+
+        # S2 关键字序列：UNION ... SELECT（允许中间夹至多 2 个噪声 token）
+        if "union" in ids:
+            ui = ids.index("union")
+            if "select" in ids[ui + 1:ui + 4]:
+                hit("S2", "UNION-SELECT 序列（语义层）", "high", "union ... select")
+
+        # S3 时间盲注函数
+        for i, (k, v) in enumerate(toks):
+            if k == "id" and v in _TIME_FN:
+                nxt = toks[i + 1][1] if i + 1 < len(toks) else ""
+                if v == "waitfor" or nxt == "(":
+                    hit("S3", "时间盲注函数（语义层）", "high", v)
+
+        # S4 命令注入：分隔符后紧跟 shell 命令
+        for i, (k, v) in enumerate(toks):
+            if k == "op" and v in (";", "|", "&", "`"):
+                nxt = toks[i + 1][1] if i + 1 < len(toks) else ""
+                if nxt in _SHELL_CMDS:
+                    hit("S4", "命令注入（语义层）", "high", "%s %s" % (v, nxt))
+
+        # S5 敏感 SQL 函数 / 系统表
+        for v in ("load_file", "xp_cmdshell", "information_schema", "outfile", "dumpfile"):
+            if v in ids:
+                hit("S5", "敏感 SQL 函数（语义层）", "high", v)
+    return hits
+
+
 def signature_detect(rec):
     """对单条日志做特征匹配，返回命中的告警列表"""
     blob = collect_blob(rec)
@@ -296,6 +459,11 @@ def signature_detect(rec):
         m = pat.search(blob)
         if m:
             hits.append(make_alert(rid, name, level, rec, m.group(0)))
+    # 语义层兜底：特征规则看的是字面，语义层看的是结构。
+    # 两者命中同一条攻击时只保留特征规则的告警，避免重复计数。
+    for a in semantic_detect(rec, blob=blob):
+        if a["rule_id"] not in [h["rule_id"] for h in hits]:
+            hits.append(a)
     return hits
 
 
@@ -328,7 +496,8 @@ class BehaviorEngine(object):
             if key not in self.fired:
                 self.fired.add(key)
                 alerts.append(make_alert("R7", "请求频率突增", "medium", rec,
-                                         "%ds 内 %d 次请求" % (BURST_WINDOW, len(self.req_window[ip]))))
+                                         "%ds 内 %d 次请求" % (BURST_WINDOW, len(self.req_window[ip])),
+                                         ts=ts))
 
         # R8 认证爆破
         url = str(rec.get("url", "")).lower()
@@ -342,7 +511,8 @@ class BehaviorEngine(object):
                 if key not in self.fired:
                     self.fired.add(key)
                     alerts.append(make_alert("R8", "疑似认证爆破", "high", rec,
-                                             "%ds 内登录失败 %d 次" % (FAIL_WINDOW, len(self.fail_window[ip]))))
+                                             "%ds 内登录失败 %d 次" % (FAIL_WINDOW, len(self.fail_window[ip])),
+                                             ts=ts))
         return alerts
 
 

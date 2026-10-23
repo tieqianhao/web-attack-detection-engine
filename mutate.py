@@ -18,6 +18,7 @@
 import sys
 import os
 import io
+import re
 import json
 import urllib.parse
 import collections
@@ -210,12 +211,58 @@ def m_mysql_version_comment(s):
 
 def m_char_func(s):
     """
-    CHAR() 十进制编码：CHAR(117,110,105,111,110) 在 MySQL 里等于 'union'。
-    载荷里一个 SQL 关键字都不出现。
+    CHAR() 部分编码：只把载荷里的一个关键字用 CHAR() 编码，其余原样保留。
+
+    踩过的坑（第三轮对抗测试最值钱的发现）：
+      第一版我写的是 head = s[:12]，只编码前 12 个字符，**剩余载荷直接丢掉**。
+      还原出来的字符串是 "1' union sel" 这种被截断的残片——它确实绕过了检测，
+      但它根本不是一个能执行的攻击。8 条"盲区"全是这么来的。
+      那是测试工具的 bug，不是检测引擎的能力边界。
+      修正后：编码一个完整关键字，载荷一字不丢。
     """
-    head = s[:12]
+    low = s.lower()
+    for kw in ("union", "select", "script", "alert", "sleep",
+               "extractvalue", "information_schema", "load_file"):
+        i = low.find(kw)
+        if i >= 0:
+            seg = s[i:i + len(kw)]
+            codes = ",".join(str(ord(c)) for c in seg if ord(c) < 128)
+            if codes:
+                return s[:i] + "char(%s)" % codes + s[i + len(kw):]
+    head = s[:6]
     codes = ",".join(str(ord(c)) for c in head if ord(c) < 128)
-    return "char(%s)" % codes if codes else s
+    return ("char(%s)" % codes + s[6:]) if codes else s
+
+
+# ---------- 变形有效性校验 ----------
+#
+# mutate.py 自己也必须有测试。否则"绕过率"里混进的不是绕过，而是脚本的 bug。
+# 判据独立于检测规则库（只看信息保留，不看正则是否命中），所以不会循环论证。
+
+_WORD_RE = re.compile(r"[a-z]{3,}")
+_STOP = {"and", "not", "for", "the", "null", "true", "false"}
+
+
+def variant_effectiveness(base, variant):
+    """
+    这个变形还算不算"同一个攻击"？返回 (是否有效, 原因)
+
+    两条判据：
+      1. 长度不能大幅缩水（截断会直接丢信息）
+      2. 原始载荷里的实词，归一化后至少要保留一半
+         注意这里比较的是"词表"而不是"检测正则"，所以不是在自证清白。
+    """
+    norm = (detect.deep_normalize(variant) + " " +
+            detect.deep_normalize(variant, comment_to_space=True)).lower()
+    if len(variant) < len(base) * 0.6:
+        return False, "载荷被截断（%d → %d 字符）" % (len(base), len(variant))
+    words = [w for w in _WORD_RE.findall(base.lower()) if w not in _STOP]
+    if words:
+        kept = [w for w in words if w in norm]
+        if len(kept) < len(words) * 0.5:
+            return False, "实词丢失 %d/%d（变形后已不是同一攻击）" % (
+                len(words) - len(kept), len(words))
+    return True, ""
 
 def m_semicolon_path(s):
     """Spring WebFlux 经典：..;/ 里的分号被当作参数分隔符剔除后仍是 ../"""
@@ -327,6 +374,57 @@ def build_protocol_record(field, payload):
     return rec
 
 
+# ---------- 采集层盲区：日志里根本没有的东西 ----------
+#
+# 这一组不是"绕过"，而是检测层的先天边界。
+# 日志驱动的检测，输入就是日志——日志里没有的字段，规则写得再完美也看不见。
+# 把它们单列出来，是为了防止把"采集层问题"当成"检测规则问题"去修：
+# 后者改代码能解决，前者只能改采集配置。混在一起会让人在错误的方向上使劲。
+
+COLLECT_CASES = [
+    ("C1", "URL 被采集层截断，载荷落在截断线之后", "truncate_url"),
+    ("C2", "POST body 未采集（配置只记 URL）", "no_body"),
+    ("C3", "分块传输：body 分片，日志只落首片", "chunked"),
+    ("C4", "请求走私：外层请求合法，内层载荷不可见", "smuggling"),
+    ("C5", "HTTPS 加密链路：中间设备只看到 SNI", "tls"),
+]
+
+
+def build_collect_case(kind):
+    """构造一条"日志里缺少关键信息"的记录"""
+    payload = _p("1' un", "ion sel", "ect null--")
+    rec = build_record("x", "q")
+    if kind == "truncate_url":
+        rec["url"] = "/search?q=" + "A" * 200 + payload
+        rec["_truncate_at"] = 200
+    elif kind == "no_body":
+        rec["url"] = "/search"
+        rec["body"] = ""
+    elif kind == "chunked":
+        rec["url"] = "/upload"
+        rec["body"] = ""
+    elif kind == "smuggling":
+        rec["url"] = "/api/health"
+        rec["body"] = ""
+    elif kind == "tls":
+        rec["url"] = "/"
+        rec["body"] = ""
+    return rec
+
+
+def run_collect_cases():
+    out = []
+    for cid, name, kind in COLLECT_CASES:
+        rec = build_collect_case(kind)
+        cut = rec.pop("_truncate_at", 0)
+        if cut:
+            rec["url"] = rec["url"][:cut]
+        hit = len(detect.signature_detect(rec)) > 0
+        out.append({"用例": cid, "名称": name, "命中": hit,
+                    "说明": "已检出" if hit else "采集层缺失，检测层无输入"})
+    return out
+
+
 def run_adversarial():
     total = 0
     bypassed = 0
@@ -334,6 +432,8 @@ def run_adversarial():
     by_cat = collections.defaultdict(lambda: [0, 0])    # 载荷类别 -> [总数, 绕过数]
     by_group = collections.defaultdict(lambda: [0, 0])  # 手法大类 -> [总数, 绕过数]
     misses = []
+    invalid_total = 0   # 所有"变形后已不是同一攻击"的用例（测试工具问题）
+    invalid_missed = 0  # 其中同时又没被检出的（应从绕过率里剔除）
 
     all_muts = MUTATIONS + MUTATIONS_V2
     for cat, pos, base in PAYLOADS:
@@ -344,7 +444,8 @@ def run_adversarial():
             # 原始写法都检不出，说明这条规则本身对该类载荷无效，记为已知盲区
             by_cat[cat][0] += 1
             by_cat[cat][1] += 1
-            misses.append({"载荷类别": cat, "手法": "原始写法", "大类": "基线"})
+            misses.append({"载荷类别": cat, "手法": "原始写法", "大类": "基线",
+                           "有效性": True, "无效原因": ""})
             total += 1
             bypassed += 1
 
@@ -357,6 +458,12 @@ def run_adversarial():
                 continue
             rec = build_record(variant, pos)
             hit = len(detect.signature_detect(rec)) > 0
+            # 有效性校验对**每一个**变形都跑，而不只是对漏报的跑。
+            # 只在漏报分支里跑的话，一旦绕过率归零，这个校验就一次都不执行——
+            # "无效变形 0"会变成一个没有验证过任何东西的漂亮数字。
+            ok, why = variant_effectiveness(base, variant)
+            if not ok:
+                invalid_total += 1
             total += 1
             by_mut[mname][0] += 1
             by_cat[cat][0] += 1
@@ -366,7 +473,10 @@ def run_adversarial():
                 by_mut[mname][1] += 1
                 by_cat[cat][1] += 1
                 by_group[group][1] += 1
-                misses.append({"载荷类别": cat, "手法": mname, "手法ID": mid, "大类": group})
+                if not ok:
+                    invalid_missed += 1
+                misses.append({"载荷类别": cat, "手法": mname, "手法ID": mid,
+                               "大类": group, "有效性": ok, "无效原因": why})
 
     # 协议层：同样的载荷换个字段，检测还看得见吗
     proto = []
@@ -392,6 +502,13 @@ def run_adversarial():
         "总用例": total,
         "绕过数": bypassed,
         "绕过率": round(bypassed / total * 100, 1) if total else 0,
+        # 修正口径：把"变形后已不是同一攻击"的用例从分子分母一起剔除。
+        # 这些是测试工具的产物，不是检测引擎的能力边界。
+        "无效变形数": invalid_total,
+        "其中未检出": invalid_missed,
+        "修正后绕过数": bypassed - invalid_missed,
+        "修正后绕过率": (round((bypassed - invalid_missed) / (total - invalid_missed) * 100, 1)
+                         if total - invalid_missed else 0),
         "按手法": {k: {"总数": v[0], "绕过": v[1],
                        "绕过率": round(v[1] / v[0] * 100, 1) if v[0] else 0}
                    for k, v in sorted(by_mut.items(), key=lambda x: -x[1][1])},
@@ -403,6 +520,7 @@ def run_adversarial():
                       for k, v in sorted(by_cat.items(), key=lambda x: -x[1][1])},
         "UA专项": ua_res,
         "协议层": proto,
+        "采集层盲区": run_collect_cases(),
         "绕过清单": misses,
     }
     with io.open(RESULT_PATH, "w", encoding="utf-8") as f:
@@ -416,6 +534,11 @@ def show(res, show_miss):
     print("=" * 58)
     print("总用例 %d 条，绕过成功 %d 条 —— 绕过率 %.1f%%"
           % (res["总用例"], res["绕过数"], res["绕过率"]))
+    if res.get("无效变形数"):
+        print("其中 %d 条经有效性校验判定为「变形后已不是同一攻击」（测试工具问题），"
+              % res["无效变形数"])
+        print("剔除后：绕过 %d 条 —— 修正绕过率 %.1f%%"
+              % (res["修正后绕过数"], res["修正后绕过率"]))
     print()
     print("【按手法大类看盲区】")
     print("  %-14s %6s %6s %8s" % ("大类", "用例", "绕过", "绕过率"))
@@ -443,6 +566,12 @@ def show(res, show_miss):
         flag = "✅检出" if r["命中"] else "❌隐身"
         print("  %-28s %-18s %s" % (r["名称"], r["字段"], flag))
     print()
+    if res.get("采集层盲区"):
+        print("\n【采集层盲区：这部分不是检测规则能解决的】")
+        for r in res["采集层盲区"]:
+            flag = "✅检出" if r["命中"] else "❌不可见"
+            print("  %-4s %-34s %-8s %s" % (r["用例"], r["名称"], flag, r["说明"]))
+        print()
     print("结果已写入：%s" % RESULT_PATH)
     if show_miss:
         print("\n【绕过成功清单（按手法归类，不含载荷原文）】")
